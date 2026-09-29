@@ -334,7 +334,9 @@ export async function gcsPutDebugIndex(indexRelPath: string): Promise<boolean> {
   const client = getStorage();
   if (!client) return false;
   try {
-    await client.uploadFileV2(Buffer.alloc(0), {
+    // The marker's name carries everything a reader needs, but the storage
+    // layer rejects empty buffers, so the body is a minimal JSON object.
+    await client.uploadFileV2(Buffer.from("{}"), {
       path: `${DEBUG_RUN_PREFIX}/${indexRelPath}`,
       contentType: "application/json",
       timeoutMs: STORAGE_TIMEOUT_MS,
