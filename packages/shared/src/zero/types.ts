@@ -106,6 +106,16 @@ export enum GuestEntity {
   CANVAS = 'CANVAS',
 }
 
+// Slack Connect — the two entity kinds that get a connectId + connect_group row.
+// Values are LOWERCASE on purpose: they are the exact strings stored in the
+// connect_group.entityType String column, so this is a code-level enum only — the
+// DB column stays a plain String and existing rows keep matching.
+// @ts-ignore TS1294
+export enum ConnectEntityType {
+  CHANNEL = 'channel',
+  CANVAS = 'canvas',
+}
+
 // @ts-ignore TS1294
 export enum RecapEntityType {
   CHANNEL = 'CHANNEL',
@@ -527,6 +537,7 @@ export enum UserType {
   USER = 'USER',
   BOT = 'BOT',
   APP = 'APP',
+  AGENT = 'AGENT',
 }
 
 // @ts-ignore TS1294
@@ -536,6 +547,7 @@ export enum AppIncomingWebhookType {
   AMAZON_SNS = 'AMAZON_SNS',
   PINGDOM = 'PINGDOM',
   GCP = 'GCP',
+  HUBSPOT = 'HUBSPOT',
 }
 
 // @ts-ignore TS1294
@@ -700,6 +712,7 @@ export enum NotificationType {
   EMAIL_FETCH_FAILED = "EMAIL_FETCH_FAILED",
   EMAIL_BACKFILL_REQUIRED = "EMAIL_BACKFILL_REQUIRED",
   CANVAS_SHARED = "CANVAS_SHARED",
+  VIEW_SHARED = "VIEW_SHARED",
   RECORDING_SHARED = "RECORDING_SHARED",
   RECORDING_SUMMARY_READY = "RECORDING_SUMMARY_READY",
   TRANSCRIPT_TRANSLATION_READY = "TRANSCRIPT_TRANSLATION_READY",
@@ -708,6 +721,7 @@ export enum NotificationType {
   MAX_WORKLOAD_REACHED = "MAX_WORKLOAD_REACHED",
   ASSIGNMENT_PAUSED = "ASSIGNMENT_PAUSED",
   ASSIGNMENT_RESUMED = "ASSIGNMENT_RESUMED",
+  DESK_ACCOUNT_DISCONNECTED = "DESK_ACCOUNT_DISCONNECTED",
 }
 
 // @ts-ignore TS1294
@@ -850,6 +864,17 @@ export enum FormFieldType {
  * project-wide, so the three must agree.
  */
 export const MAX_DUPLICATE_SCOPE_FIELDS = 5;
+
+/** Max apps published to one channel, DM, group DM or desk (channel_published_tabs). */
+export const MAX_PUBLISHED_APPS = 8;
+
+/** channel_published_tabs.entityType — what a published channel tab points at. */
+export const ChannelPublishedEntityType = {
+  APP: 'APP',
+} as const;
+
+export type ChannelPublishedEntityType =
+  typeof ChannelPublishedEntityType[keyof typeof ChannelPublishedEntityType];
 
 // @ts-ignore TS1294
 export enum FormContextType {
@@ -1055,10 +1080,12 @@ export enum SavedConfigEntityName {
   FORM_ENTITY_VALUE = 'FORM_ENTITY_VALUE',
 }
 
-// Who a saved-view share grant targets. USER today; USER_GROUP / CHANNEL slots reserved.
+// Who a saved-view share grant targets. USER shares with an individual; CHANNEL shares
+// with every current & future member of a channel. USER_GROUP slot reserved.
 // @ts-ignore TS1294
 export enum ViewAccessEntityType {
   USER = 'USER',
+  CHANNEL = 'CHANNEL',
 }
 
 // @ts-ignore TS1294

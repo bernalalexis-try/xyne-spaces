@@ -6,13 +6,15 @@
 import express, { Router, Request, Response } from 'express';
 import crypto from 'crypto';
 import type { ExternalSource } from '@prisma/client';
-import { DeskType, isDeskChannelType } from '@xyne/shared';
+import { ChannelType, DeskType, isDeskChannelType } from '@xyne/shared';
 import { WORKSPACE_LEVEL } from '@/integrations/core/sourceScope';
 import { extractEmailAddress } from '@/utils/email';
 import { MAILBOX_SOURCE_TYPES } from '@/database/repositories/externalSourceRepository';
 import { authenticate } from '../core/authenticate';
 import { adapterResolver } from '../middleware/adapterResolver';
 import { adapterRegistry } from '../core/adapterRegistry';
+import { ExternalSourcePlatform } from '../core/types';
+import { facebookPageIdsInPayload } from '../adapters/social-media/facebook/flow';
 import { logger } from '../../utils/logger';
 import { RawBodyRequest } from '@/types/express';
 import { webhookLimiter } from '@/middleware/rateLimiters';
@@ -69,9 +71,15 @@ export async function resolveChannelMailbox(
   if (!mailbox) {
     const channel = await db.channel.findUnique({
       where: { id: channelId },
-      select: { workspaceId: true },
+      select: { workspaceId: true, type: true },
     });
-    if (channel?.workspaceId) {
+    if (channel?.type === ChannelType.CALL && channel.workspaceId) {
+      mailbox = await db.externalSource.findFirst({
+        where: { workspaceId: channel.workspaceId, sourceType: 'ozonetel', isActive: true },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (mailbox) targetChannelId = channelId;
+    } else if (channel?.workspaceId) {
       const channelEmailSource = await channelEmailAliasService.getWorkspaceChannelEmailSource(
         channel.workspaceId,
       );
@@ -148,26 +156,34 @@ router.use(webhookLimiter);
  * Returns "OK" without authentication - used by external services to verify endpoint
  * Matches Haskell implementation: webhookGetHandler _ _ = pure "OK"
  */
-router.get('/:sourceName/ingest', (_req, res: Response) => {
-  return res.status(200).send('OK');
-});
+router.get(
+  '/:sourceName/ingest',
+  (req, res, next) => {
+    // Only run adapterResolver when hub.mode is present (Meta-style webhook verification).
+    // Otherwise return plain 200 OK — preserves behaviour for Slack/Microsoft/Ozonetel health probes
+    // and any external service that GETs the endpoint to verify it's reachable.
+    if (req.query['hub.mode']) {
+      return adapterResolver(req, res, () => next());
+    }
+    return next();
+  },
+  (_req, res: Response) => {
+    return res.status(200).send('OK');
+  },
+);
 
 /**
- * External source sync endpoint
  * POST /api/external-source-sync/:sourceName/ingest
  *
- * Flow:
- * 1. adapterResolver - Resolve adapter from sourceName
- * 2. authenticate - Authenticate using adapter.authenticate()
- * 3. handler - Orchestrate preprocess → transform → sync
- *
- * Note: express.json() with verify callback is applied at app level
- * This provides both req.body (parsed) and req.rawBody (raw string)
+ * Unified webhook ingestion endpoint for all external sources.
+ * HMAC-SHA256 signature verification for Instagram is handled inside
+ * MetaWebhookAuthenticator.authenticate() — no duplicate route middleware needed.
+ * Meta's configured webhook URL (/instagram/ingest) routes here with sourceName='instagram'.
  */
 router.post(
   '/:sourceName/ingest',
-  adapterResolver, // Resolve adapter, attach to req
-  authenticate, // Authenticate using req.adapter
+  adapterResolver,
+  authenticate,
   async (req, res: Response) => {
     const startTime = Date.now();
 
@@ -201,6 +217,26 @@ router.post(
         throw new Error(`External source ingest: no resolvable workspaceId for source ${source?.id ?? sourceName}`);
       }
       const results = await ingestExternalSource(ingestWorkspaceId, adapter, sourceName, req.body, source);
+
+      // Meta can batch events for several Pages into one POST, but authenticate resolved only one
+      // connected Page. The signature covers the whole body, so ingest the rest against their own sources;
+      // FacebookFlow keeps each source to its own entries.
+      if (source?.sourceType === ExternalSourcePlatform.FACEBOOK) {
+        const repo = new ExternalSourceRepository();
+        const otherPageIds = facebookPageIdsInPayload(req.body).filter(
+          pageId => pageId !== source.externalIdentifier,
+        );
+        // Pages are independent sources, so run them side by side: Meta redelivers the whole
+        // batch if this request is slow to answer.
+        const otherResults = await Promise.all(
+          otherPageIds.map(async pageId => {
+            const other = await repo.findByName(`facebook-${pageId}`);
+            if (!other?.isActive) return [];
+            return ingestExternalSource(other.workspaceId, adapter, other.name, req.body, other);
+          }),
+        );
+        results.push(...otherResults.flat());
+      }
 
       const duration = Date.now() - startTime;
       logger.info(`Data processed in ${duration}ms`, {
@@ -519,6 +555,10 @@ router.post(
             error: 'App desk history fetch requires ENABLE_EMAIL_FETCH_WORKER=true',
           });
         }
+        // A call pull waits 31s between Ozonetel requests, far too long to hold an HTTP request open.
+        if (mailboxTarget.source.sourceType === 'ozonetel') {
+          return res.status(503).json({ success: false, error: 'Call fetch needs the background fetch worker, which is turned off.' });
+        }
         if (mailboxTarget !== actionable[0] || actionable.length > 1) {
           logger.info('Worker disabled — skipping app targets, fetching mailbox inline', {
             channelId,
@@ -558,8 +598,14 @@ router.post(
       // dead-letter key from wedging that source+range permanently.
       const jobs: Array<{ sourceId: string; installedAppId: string | null; jobId: string }> = [];
       for (const { source, installedAppId, jobData } of actionable) {
+        const isCallPull = source.sourceType === 'ozonetel';
+        // Ozonetel allows 2 requests a minute per account, so only one call pull may run per source.
+        const callPullJobId = `ozonetel-refetch:${source.id}`;
+        if (isCallPull && (await emailFetchQueue.getQueue().getJob(callPullJobId))) {
+          return res.status(409).json({ success: false, error: 'A call fetch is already running. Try again when it finishes.' });
+        }
         const job = await emailFetchQueue.getQueue().add(
-          'refetch',
+          isCallPull ? 'ozonetel-refetch' : 'refetch',
           {
             sourceId: source.id,
             channelId,
@@ -569,7 +615,11 @@ router.post(
             endDate,
             ...jobData,
           },
-          { jobId: refetchJobIdFor(source.id, jobData), removeOnComplete: true, removeOnFail: true },
+          {
+            jobId: isCallPull ? callPullJobId : refetchJobIdFor(source.id, jobData),
+            removeOnComplete: true,
+            removeOnFail: true,
+          },
         );
         logger.info('Fetch enqueued', { jobId: job.id, sourceId: source.id, channelId });
         jobs.push({ sourceId: source.id, installedAppId, jobId: String(job.id) });

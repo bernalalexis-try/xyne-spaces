@@ -11,10 +11,10 @@
  * `{ score: null, reasoning: "judge_unavailable" }` so a transient LiteLLM
  * outage marks the turn un-judged rather than fabricating a score.
  */
-import { LITELLM } from "./config.js";
+import { LITELLM, litellmEndpoint } from "./config.js";
 import { withLlmSlot, pauseLlmGate, retryAfterMs } from "./llm-gate.js";
 import { jevAskOn, judgeBackendConfigured, type JevQuestion } from "./jev.js";
-import { isJudgeBackend, type JudgeBackendName } from "./judge-backend.js";
+import { resolveJudgeBackend, type JudgeBackendName } from "./judge-backend.js";
 
 import { createLogger } from "./logger.js";
 const log = createLogger("eval-judge");
@@ -181,8 +181,8 @@ async function judgeViaJev(backend: JudgeBackendName, input: EvalJudgeInput): Pr
 }
 
 export async function judgeSemanticMatch(input: EvalJudgeInput): Promise<EvalJudgeResult> {
-  const requested = input.model?.trim().toLowerCase();
-  if (!input.copilot?.token && isJudgeBackend(requested) && requested !== "llm") {
+  const requested = resolveJudgeBackend(input.model);
+  if (!input.copilot?.token && requested && requested !== "llm") {
     return judgeViaJev(requested, input);
   }
   const viaCopilot = !!input.copilot?.token;
@@ -194,7 +194,7 @@ export async function judgeSemanticMatch(input: EvalJudgeInput): Promise<EvalJud
   const model = viaCopilot
     ? input.copilot!.model
     : (input.model && input.model.trim()) || LITELLM.fastModel;
-  const url = viaCopilot ? COPILOT_COMPLETIONS_URL : `${LITELLM.url}/v1/chat/completions`;
+  const url = viaCopilot ? COPILOT_COMPLETIONS_URL : litellmEndpoint("/v1/chat/completions");
   const headers = viaCopilot
     ? copilotHeaders(input.copilot!.token)
     : { "Content-Type": "application/json", Authorization: `Bearer ${LITELLM.apiKey}` };
@@ -283,7 +283,7 @@ export async function listJudgeModels(): Promise<string[]> {
   if (!LITELLM.apiKey) return [];
   const headers = { Authorization: `Bearer ${LITELLM.apiKey}` };
   try {
-    const res = await fetch(`${LITELLM.url}/model/info`, { headers, signal: AbortSignal.timeout(15_000) });
+    const res = await fetch(litellmEndpoint("/model/info"), { headers, signal: AbortSignal.timeout(15_000) });
     if (res.ok) {
       const data = (await res.json()) as {
         data?: Array<{ model_name?: unknown; litellm_params?: { custom_llm_provider?: unknown } }>;
@@ -317,7 +317,7 @@ export async function listJudgeModels(): Promise<string[]> {
     .map((m) => m.trim())
     .filter(Boolean);
   try {
-    const res = await fetch(`${LITELLM.url}/v1/models`, { headers, signal: AbortSignal.timeout(15_000) });
+    const res = await fetch(litellmEndpoint("/v1/models"), { headers, signal: AbortSignal.timeout(15_000) });
     if (!res.ok) return allowlist.sort();
     const data = (await res.json()) as { data?: Array<{ id?: unknown }> };
     const visible = new Set(

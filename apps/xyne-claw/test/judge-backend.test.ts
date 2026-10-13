@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { jevAsk, jevEnabled, judgeBackendConfigured, type JevQuestion } from "../src/jev.js";
 import { judgeRunSummary, pinRunJudgeBackend, recordJudgeOutcome, setJudgeDebugSink } from "../src/judge-backend.js";
 import { parseLlmJudgeReply } from "../src/judge-llm.js";
+import { isolateEnv } from "./helpers/env.js";
 
 const QUESTIONS: Record<string, JevQuestion> = {
   a: { type: "noul", instructions: "is it done?" },
@@ -28,27 +29,15 @@ function chatReply(values: Record<string, number>): Response {
   );
 }
 
+isolateEnv(ENV_KEYS, { clear: true });
+
+let fetchMock: ReturnType<typeof vi.fn>;
+beforeEach(() => {
+  fetchMock = vi.fn();
+  vi.stubGlobal("fetch", fetchMock);
+});
+
 describe("judge backends", () => {
-  const saved: Record<string, string | undefined> = {};
-  let fetchMock: ReturnType<typeof vi.fn>;
-
-  beforeEach(() => {
-    for (const key of ENV_KEYS) {
-      saved[key] = process.env[key];
-      delete process.env[key];
-    }
-    fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
-  });
-
-  afterEach(() => {
-    for (const key of ENV_KEYS) {
-      if (saved[key] === undefined) delete process.env[key];
-      else process.env[key] = saved[key];
-    }
-    vi.unstubAllGlobals();
-  });
-
   it("routes each run to the backend it was pinned to", async () => {
     process.env["JEV_API_KEY"] = "k-jev";
     process.env["OUR_JEV_URL"] = "https://ourjev.internal/v1/systemone";
@@ -64,7 +53,7 @@ describe("judge backends", () => {
 
     const seen: Record<string, string> = {};
     await Promise.all(
-      (["jev", "ournormaljev", "ourtrainedjev", "llm"] as const).map(
+      (["jev", "xor", "ourtrainedjev", "llm"] as const).map(
         (backend) =>
           new Promise<void>((resolve) => {
             setImmediate(async () => {
@@ -77,17 +66,17 @@ describe("judge backends", () => {
       ),
     );
 
-    expect(seen).toEqual({ jev: "jev", ournormaljev: "ournormaljev", ourtrainedjev: "ourtrainedjev", llm: "llm" });
+    expect(seen).toEqual({ jev: "xor", xor: "xor", ourtrainedjev: "ourtrainedjev", llm: "llm" });
     const urls = fetchMock.mock.calls.map((c) => String(c[0])).sort();
     expect(urls).toEqual([
-      "https://api.typesafe.ai/v1/systemone",
       "https://llm.internal/v1/chat/completions",
+      "https://ourjev.internal/v1/systemone",
       "https://ourjev.internal/v1/systemone",
       "https://ourjev.internal/v1/systemone",
     ]);
     const ours = fetchMock.mock.calls.filter((c) => String(c[0]).includes("ourjev"));
     const sentModels = ours.map((c) => (JSON.parse(String((c[1] as RequestInit).body)) as { model?: string }).model).sort();
-    expect(sentModels).toEqual(["our-jev-base", "our-jev-ft-v3"]);
+    expect(sentModels).toEqual(["our-jev-base", "our-jev-base", "our-jev-ft-v3"]);
     for (const call of ours) {
       expect((call[1] as RequestInit).headers).toMatchObject({ Authorization: "Bearer k-ours" });
     }
@@ -105,15 +94,15 @@ describe("judge backends", () => {
   it("hides a variant that would be indistinguishable from its sibling", () => {
     process.env["OUR_JEV_URL"] = "https://ourjev.internal/v1/systemone";
     process.env["OUR_JEV_API_KEY"] = "k-ours";
-    expect(judgeBackendConfigured("ournormaljev")).toBe(false);
+    expect(judgeBackendConfigured("xor")).toBe(false);
     expect(judgeBackendConfigured("ourtrainedjev")).toBe(false);
 
     process.env["OUR_TRAINED_JEV_MODEL"] = "our-jev-ft-v3";
     expect(judgeBackendConfigured("ourtrainedjev")).toBe(true);
-    expect(judgeBackendConfigured("ournormaljev")).toBe(false);
+    expect(judgeBackendConfigured("xor")).toBe(false);
 
     process.env["OUR_NORMAL_JEV_URL"] = "https://ourjev-base.internal/v1/systemone";
-    expect(judgeBackendConfigured("ournormaljev")).toBe(true);
+    expect(judgeBackendConfigured("xor")).toBe(true);
   });
 
   it("lets a variant override the shared endpoint and key", async () => {
@@ -130,19 +119,21 @@ describe("judge backends", () => {
   });
 
   it("records per-run call stats including failures", async () => {
-    process.env["JEV_API_KEY"] = "k-jev";
+    process.env["OUR_NORMAL_JEV_URL"] = "https://ourjev.internal/v1/systemone";
+    process.env["OUR_JEV_API_KEY"] = "k-ours";
     pinRunJudgeBackend("jev");
     fetchMock.mockResolvedValueOnce(systemOneReply({ a: 1, b: 0 }));
     fetchMock.mockResolvedValueOnce(new Response("nope", { status: 500 }));
     await jevAsk("state", QUESTIONS, { purpose: "sift" });
     await jevAsk("state", QUESTIONS, { purpose: "sift" });
     const summary = judgeRunSummary();
-    expect(summary).toMatchObject({ backend: "jev", calls: 2, failed: 1, questions: 4 });
+    expect(summary).toMatchObject({ backend: "xor", calls: 2, failed: 1, questions: 4 });
     expect(summary?.byPurpose["sift"]).toMatchObject({ calls: 2, failed: 1 });
   });
 
   it("shadows the same questions on other backends and scores agreement", async () => {
-    process.env["JEV_API_KEY"] = "k-jev";
+    process.env["OUR_NORMAL_JEV_URL"] = "https://ourjev.internal/v1/systemone";
+    process.env["OUR_JEV_API_KEY"] = "k-ours";
     process.env["JUDGE_LLM_URL"] = "https://llm.internal/v1/chat/completions";
     process.env["JUDGE_LLM_API_KEY"] = "k-llm";
     process.env["JUDGE_LLM_MODEL"] = "judge-model";
@@ -157,31 +148,15 @@ describe("judge backends", () => {
     await vi.waitFor(() => expect(judgeRunSummary()?.shadows.length).toBe(1));
 
     const shadow = judgeRunSummary()?.shadows[0];
-    expect(shadow).toMatchObject({ primary: "jev", shadow: "llm", questions: 2, agreed: 1 });
+    expect(shadow).toMatchObject({ primary: "xor", shadow: "llm", questions: 2, agreed: 1 });
     expect(shadow?.meanAbsDiff).toBeCloseTo(0.5, 5);
   });
 });
 
 describe("judge debug events", () => {
-  const saved: Record<string, string | undefined> = {};
-  let fetchMock: ReturnType<typeof vi.fn>;
-
   beforeEach(() => {
-    for (const key of ENV_KEYS) {
-      saved[key] = process.env[key];
-      delete process.env[key];
-    }
-    process.env["JEV_API_KEY"] = "k-jev";
-    fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
-  });
-
-  afterEach(() => {
-    for (const key of ENV_KEYS) {
-      if (saved[key] === undefined) delete process.env[key];
-      else process.env[key] = saved[key];
-    }
-    vi.unstubAllGlobals();
+    process.env["OUR_NORMAL_JEV_URL"] = "https://ourjev.internal/v1/systemone";
+    process.env["OUR_JEV_API_KEY"] = "k-ours";
   });
 
   it("sends every call and outcome to the run's debug sink", async () => {
@@ -196,9 +171,9 @@ describe("judge debug events", () => {
     recordJudgeOutcome("tool-search", "added 1", { added: [{ name: "spaces-desk-metrics", score: 0.9 }] });
 
     expect(events.map((e) => e.kind)).toEqual(["judge_call", "judge_call", "judge_outcome"]);
-    expect(events[0]?.data).toMatchObject({ backend: "jev", purpose: "tool-search", questions: 2, ok: true });
+    expect(events[0]?.data).toMatchObject({ backend: "xor", purpose: "tool-search", questions: 2, ok: true });
     expect(events[1]?.data).toMatchObject({ ok: false });
-    expect(events[2]?.data).toMatchObject({ backend: "jev", purpose: "tool-search", summary: "added 1" });
+    expect(events[2]?.data).toMatchObject({ backend: "xor", purpose: "tool-search", summary: "added 1" });
     expect(JSON.parse(String(events[2]?.data["detail"]))).toEqual({ added: [{ name: "spaces-desk-metrics", score: 0.9 }] });
   });
 
