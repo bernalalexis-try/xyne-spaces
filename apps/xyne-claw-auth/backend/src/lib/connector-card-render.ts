@@ -4,7 +4,6 @@ import {
   withSpacesAppId,
   type FlowDefinition,
 } from "xyne-claw-shared";
-import { SUPPORTED_PROVIDERS } from "../constants.js";
 import { prisma } from "../db.js";
 import { createLogger } from "../logger.js";
 import { userProviderCredentialsRepository } from "../repositories/index.js";
@@ -15,10 +14,8 @@ import {
   PROVIDER_CONNECT_METHOD,
   PROVIDER_DESCRIPTIONS,
   PROVIDER_LABELS,
-  providersUserAskedFor,
-  stripAddressedAgentMention,
-  unsupportedProvidersFromText,
-  wantsProviderRoster,
+  normalizeProviderName,
+  SUPPORTED_PROVIDERS,
 } from "./provider-hints.js";
 
 const log = createLogger("connector-card");
@@ -47,6 +44,13 @@ export interface ConnectorCardIdentity {
   spacesAppId: string | undefined;
 }
 
+export interface ResolvedConnectorSuggestions {
+  connectors: Array<{ serverType: string; name: string; description?: string; connected: boolean }>;
+  /** The roster ("what can I connect?") rather than named suggestions. */
+  listAll: boolean;
+  totalCount?: number;
+}
+
 /**
  * Connector suggestion card. Display + client-side connect only — there is no
  * server-side action or terminal state for this card on any surface.
@@ -55,13 +59,16 @@ export interface ConnectorCardIdentity {
  * org-shared credentials) is dropped — offering to connect it again is noise —
  * unless one of its calls failed with 401/403 this turn (`blockedConnectors`):
  * then the working credential is not working, and reconnecting is the fix.
+ *
+ * This resolves WHICH connectors the card offers — the half every surface
+ * shares; messaging channels render the same list as buttons
+ * (surfaces/messaging/widgets.ts). Null when nothing is left to offer.
  */
-export async function renderConnectorSuggestCard(args: {
+export async function resolveSuggestedConnectors(args: {
   suggestions: PendingConnectorSuggestions;
   blockedConnectors: string[] | undefined;
-  id: ConnectorCardIdentity;
-  target: FlowCardTarget;
-}): Promise<FlowDefinition | null> {
+  id: Pick<ConnectorCardIdentity, "agentSlug" | "agentOrgId" | "userId">;
+}): Promise<ResolvedConnectorSuggestions | null> {
   const { suggestions, id } = args;
   // Roster mode: the user asked what exists, so the SERVER picks the sample —
   // the model must not decide which connectors represent the catalog.
@@ -123,6 +130,19 @@ export async function renderConnectorSuggestCard(args: {
     );
     return null;
   }
+  return { connectors, listAll, ...(totalCount !== undefined ? { totalCount } : {}) };
+}
+
+export async function renderConnectorSuggestCard(args: {
+  suggestions: PendingConnectorSuggestions;
+  blockedConnectors: string[] | undefined;
+  id: ConnectorCardIdentity;
+  target: FlowCardTarget;
+}): Promise<FlowDefinition | null> {
+  const { suggestions, id } = args;
+  const resolved = await resolveSuggestedConnectors(args);
+  if (!resolved) return null;
+  const { connectors, listAll, totalCount } = resolved;
 
   const flow = withSpacesAppId(
     buildMcpSuggestFlow({
@@ -148,33 +168,60 @@ export async function renderConnectorSuggestCard(args: {
 }
 
 /**
- * AI provider suggestion card. The roster is a fixed list in code, so intent is
- * read from the user's own message and the model never participates. A provider
- * we do not offer is named back as unsupported rather than dropped, so the reply
- * cannot promise a card that will never render.
+ * What the agent's `suggest-providers` call queued (claw -> callback payload).
+ * The ONLY source of a provider card: the server never reads the user's words.
+ */
+export interface PendingProviderSuggestions {
+  providers: string[];
+  listAll?: boolean | undefined;
+  title?: string | undefined;
+}
+
+/**
+ * AI provider suggestion card. Display + client-side connect only.
+ *
+ * A provider the user is already connected to is dropped — offering to connect
+ * it again is noise — EXCEPT on a roster ask (`listAll`), where seeing what is
+ * already connected is the point of asking. `spaces` is the built-in default
+ * and counts as connected everywhere.
  */
 export async function renderProviderSuggestCard(args: {
-  taskText: string;
+  suggestions: PendingProviderSuggestions;
   id: ConnectorCardIdentity;
   target: FlowCardTarget;
 }): Promise<FlowDefinition | null> {
-  const { id } = args;
-  const askText = stripAddressedAgentMention(args.taskText, id.agentSlug);
-  const namedProviders = providersUserAskedFor(askText);
-  const unsupported = unsupportedProvidersFromText(askText);
-  const providerRoster = wantsProviderRoster(askText);
+  const { id, suggestions } = args;
+  // Named providers win over the roster, mirroring suggest-providers.
+  const listAll = suggestions.listAll === true && suggestions.providers.length === 0;
+  const named = listAll
+    ? []
+    : [
+        ...new Set(
+          suggestions.providers
+            .map((name) => normalizeProviderName(name))
+            .filter((match): match is NonNullable<typeof match> => match !== null),
+        ),
+      ];
 
-  if (namedProviders.length === 0 && !providerRoster) {
-    if (unsupported.length > 0) {
-      log.info(`[provider-suggest] unsupported only: ${unsupported.join(", ")} — no card`);
-    }
+  if (named.length === 0 && !listAll) {
+    log.info(`[provider-suggest] skipped — no known provider in [${suggestions.providers.join(", ")}]`);
     return null;
   }
 
   const creds = await userProviderCredentialsRepository.listByUser(id.userId).catch(() => []);
   const connectedByProvider = new Map(creds.map((c) => [c.provider, c] as const));
+  const isConnected = (provider: string): boolean =>
+    provider === "spaces" || connectedByProvider.has(provider);
 
-  const shown = providerRoster ? [...SUPPORTED_PROVIDERS] : namedProviders;
+  const shown = (listAll ? [...SUPPORTED_PROVIDERS] : named).filter(
+    (provider) => listAll || !isConnected(provider),
+  );
+
+  if (shown.length === 0) {
+    log.info(`[provider-suggest] skipped — ${named.join(", ")}: already connected`);
+    return null;
+  }
+
   const providers = shown.map((provider) => {
     const cred = connectedByProvider.get(provider);
     return {
@@ -200,13 +247,10 @@ export async function renderProviderSuggestCard(args: {
   const flow = withSpacesAppId(
     buildProviderSuggestFlow({
       providers,
-      title: providerRoster ? "AI providers you can connect" : "Connect this provider",
-      ...(providerRoster ? { browseAll: true, totalCount: SUPPORTED_PROVIDERS.length } : {}),
-      ...(unsupported.length > 0
-        ? {
-            reason: `${unsupported.join(", ")} ${unsupported.length === 1 ? "is" : "are"} not available on Xyne.`,
-          }
-        : {}),
+      title:
+        suggestions.title?.trim() ||
+        (listAll ? "AI providers you can connect" : "Connect this provider"),
+      ...(listAll ? { browseAll: true, totalCount: SUPPORTED_PROVIDERS.length } : {}),
       screenKey: `${id.userId}-${shown.join("-")}`,
       ...(id.agentSlug ? { agentSlug: id.agentSlug } : {}),
       userId: id.userId,

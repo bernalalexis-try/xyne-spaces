@@ -28,7 +28,7 @@ import {
   type ProgressEmitter,
   type Attachment,
 } from "../agent.js";
-import {
+import { parseReplyFormat,
   frameSseEvent,
   KEEPALIVE_FRAME,
   type ClawStreamEvent,
@@ -45,9 +45,12 @@ import {
   openPaletteModeFromTools,
 } from "xyne-claw-shared";
 import { SessionLockedError } from "../session-lock.js";
+import { matchesDirectPick } from "../tool-resolution.js";
+import { describeFetchError } from "../run-deadline.js";
 import { SandboxUnavailableError } from "../sandbox-unavailable.js";
 import { isSafeId } from "../safe-id.js";
 import { sanitizeCitations } from "../citation-sanitizer.js";
+import { TurnParts } from "../turn-parts.js";
 import { validateS2SKey } from "../middleware/auth.js";
 import { transientProviderCallback } from "../transient-provider-callback.js";
 import { loadMcpToolsForUser,
@@ -68,6 +71,7 @@ import { activeToolCap, demotedCatalogItem, planActiveToolCap, readToolUsageRank
 import { buildExperimentTools, buildExperimentReviewTools, type ExperimentContext } from "../experiment.js";
 import {
   executeRunFromPayload,
+  type AgentHandoffNote,
   type InternalRunPayload,
   type RunExecutionState,
 } from "../run-execution.js";
@@ -89,6 +93,7 @@ import {
   asFollowUpPendingQuestion,
   buildFollowUpGenerationEndEvent,
   buildFollowUpGenerationStartEvent,
+  describeFollowUpGenerationInput,
   generateFollowUpSuggestions,
   normalizeFollowUpAgentContext,
   normalizeFollowUpConversationHistory,
@@ -134,7 +139,7 @@ import {
   parseToolsConfig,
   resolveAgentToolsConfig,
   COPILOT_SYSTEM_INSTRUCTION,
-  REPO_CONFIGS,
+  getRepoConfigsFor,
   getSandboxSession,
   probeSession,
   buildSandboxStoreKey,
@@ -160,6 +165,7 @@ import { presentationCatalogDefaultOn, isFreePresentationTool, buildPresentation
 import { buildProposeAgentTool, type ProposeAgentRef } from "../propose-agent.js";
 import { buildDescribeAgentTool, type DescribeAgentRef } from "../describe-agent.js";
 import { buildSuggestConnectorsTool, SUGGEST_CONNECTORS_TOOL_NAME, type SuggestConnectorsRef } from "../suggest-connectors.js";
+import { buildSuggestProvidersTool, SUGGEST_PROVIDERS_TOOL_NAME, type SuggestProvidersRef } from "../suggest-providers.js";
 import { buildEmitBriefTool, EMIT_BRIEF_TOOL_NAME, type EmitBriefRef } from "../daily-brief.js";
 import {
   buildSuggestGoalTool,
@@ -333,7 +339,7 @@ function dedupeToolsByName(tools: ToolDefinition[]): ToolDefinition[] {
 
 /** Snapshot for shutdown/drain forensics — one line per still-active run. */
 /**
- * `read-app-file` rides on `create-app` selection.
+ * `read-app-file` and `publish-app` ride on `create-app` selection.
  *
  * The two are one feature. `create-app` writes a project but hands back only a
  * manifest — file paths, never contents — so without the read half an
@@ -349,7 +355,10 @@ function dedupeToolsByName(tools: ToolDefinition[]): ToolDefinition[] {
  */
 function expandCustomSelection(custom: string[] | undefined): Set<string> {
   const selected = new Set(custom ?? []);
-  if (selected.has("create-app")) selected.add("read-app-file");
+  if (selected.has("create-app")) {
+    selected.add("read-app-file");
+    selected.add("publish-app");
+  }
   return selected;
 }
 
@@ -578,6 +587,7 @@ router.post("/run", validateS2SKey, async (req, res: Response) => {
     planContinuation,
     awakening,
     generateFollowUpSuggestions: shouldGenerateFollowUpSuggestions,
+    agentHandoff,
   } = req.body as InternalRunPayload;
 
   const experiment = normalizeExperimentContext(rawExperiment);
@@ -836,6 +846,7 @@ router.post("/run", validateS2SKey, async (req, res: Response) => {
       shouldGenerateFollowUpSuggestions,
       typeof callbackUrl === "string" ? callbackUrl : undefined,
       awakening,
+      agentHandoff,
     ).finally(() => {
       if (activeRun.handoffCapTimer) clearTimeout(activeRun.handoffCapTimer);
       if (activeRun.gracefulInterruptSummaryTimer) clearTimeout(activeRun.gracefulInterruptSummaryTimer);
@@ -962,6 +973,7 @@ router.post("/run", validateS2SKey, async (req, res: Response) => {
         shouldGenerateFollowUpSuggestions,
         typeof callbackUrl === "string" ? callbackUrl : undefined,
         awakening,
+        agentHandoff,
       );
     } catch (err) {
       processTaskError = err;
@@ -1141,11 +1153,12 @@ function makeSseProgressEmitter(initialRes: Response, sessionId: string): SsePro
     pr: (sid, pr: Record<string, unknown>) => write({ event: "pr", seq: next(), sessionId: sid, pr }),
     uiWidget: (sid, widget: UiWidget) => write({ event: "ui-widget", seq: next(), sessionId: sid, widget }),
     streamChunk: (sid, payload) => {
+      const partId = payload.partId ? { partId: payload.partId } : {};
       if (payload.reasoningDelta !== undefined) {
-        write({ event: "reasoning", seq: next(), sessionId: sid, reasoningDelta: payload.reasoningDelta });
+        write({ event: "reasoning", seq: next(), sessionId: sid, reasoningDelta: payload.reasoningDelta, ...partId });
       }
       if (payload.textDelta !== undefined) {
-        write({ event: "delta", seq: next(), sessionId: sid, textDelta: payload.textDelta });
+        write({ event: "delta", seq: next(), sessionId: sid, textDelta: payload.textDelta, ...partId });
       }
     },
     debugProgress: (sid, event) => write({ event: "debug", seq: next(), sessionId: sid, debugEvent: event }),
@@ -1511,6 +1524,7 @@ export async function processTask(
     windowEndMs?: number;
     entryPath?: string;
   },
+  agentHandoff?: AgentHandoffNote,
   execution?: RunExecutionState,
 ): Promise<void> {
   // Started here so the extractor overlaps session restore + MCP listing;
@@ -1587,6 +1601,7 @@ export async function processTask(
   const proposeAgentRef: ProposeAgentRef = {};
   const describeAgentRef: DescribeAgentRef = {};
   const suggestConnectorsRef: SuggestConnectorsRef = {};
+  const suggestProvidersRef: SuggestProvidersRef = {};
   const blockedConnectors = new Set<string>();
   const emitBriefRef: EmitBriefRef = {};
   let callbackProvider = provider ?? "spaces";
@@ -1603,17 +1618,15 @@ export async function processTask(
   const followUpConversationHistory = normalizeFollowUpConversationHistory(
     agentConfig?.["followUpConversationHistory"],
   );
-  const followUpGenerationInput = followUpConversationHistory.length > 0
-    ? "conversation_history_and_prompt"
-    : "prompt_only";
-  const parallelFollowUpStartedAt = new Date().toISOString();
-  const parallelFollowUpDebugSeq = Date.now();
-  let parallelFollowUpResult:
-    | { generation: FollowUpGenerationResult; completedAt: string }
-    | undefined;
-  let parallelFollowUpPromise:
-    | Promise<{ generation: FollowUpGenerationResult; completedAt: string }>
-    | undefined;
+  // Follow-ups are generated AFTER the agent loop finishes so the model sees
+  // the user's request AND the agent's final answer. Suggestions grounded in
+  // the actual answer ("drill into item X it listed", "apply the fix it
+  // proposed") are far more useful than ones guessed from the question alone.
+  const followUpGenerationInput = describeFollowUpGenerationInput(
+    followUpConversationHistory.length,
+    true,
+  );
+  const runDebugStartedAt = new Date().toISOString();
 
   try {
     // SSRF guard: progressUrl is caller-supplied and gets POSTed to on every
@@ -1630,49 +1643,6 @@ export async function processTask(
     log(
       `Session ${sessionId}: starting for user ${userId}, progressUrl=${progressUrlLabel}`,
     );
-    if (followUpsEnabled) {
-      // Follow-ups use prior conversation plus the current user prompt, but
-      // never wait for the current assistant response. This fast-model request
-      // overlaps the main agent run and stays off the answer's critical path.
-      pushDebugProgress(
-        progressUrl,
-        sessionId,
-        buildFollowUpGenerationStartEvent({
-          seq: parallelFollowUpDebugSeq,
-          at: parallelFollowUpStartedAt,
-          sessionId,
-          model: LITELLM.fastModel,
-          generationInput: followUpGenerationInput,
-          conversationMessageCount: followUpConversationHistory.length,
-          ...(followUpAgentContext ? { agentContext: followUpAgentContext } : {}),
-        }),
-      );
-      parallelFollowUpPromise = generateFollowUpSuggestions(
-        task,
-        followUpAgentContext,
-        followUpConversationHistory,
-        abortSignal,
-      ).then((generation) => {
-        const settled = { generation, completedAt: new Date().toISOString() };
-        pushDebugProgress(
-          progressUrl,
-          sessionId,
-          buildFollowUpGenerationEndEvent({
-            seq: parallelFollowUpDebugSeq + 1,
-            at: settled.completedAt,
-            startedAt: parallelFollowUpStartedAt,
-            sessionId,
-            model: LITELLM.fastModel,
-            generationInput: followUpGenerationInput,
-            conversationMessageCount: followUpConversationHistory.length,
-            ...(followUpAgentContext ? { agentContext: followUpAgentContext } : {}),
-            generation,
-          }),
-        );
-        parallelFollowUpResult = settled;
-        return settled;
-      });
-    }
 
     // All per-type attachment ingestion (filter → decode → convert to a
     // `.context/` markdown sibling, plus the pdf/video/zip side effects) lives
@@ -1813,7 +1783,10 @@ export async function processTask(
 
     // Task commands are parsed before custom-tool loading so command-owned
     // tools can be force-mounted for this run without mutating Agent.config.
-    const forcedTaskCommandTools = new Set(taskCommand?.autoTools ?? []);
+    const forcedTaskCommandTools = new Set([
+      ...(taskCommand?.autoTools ?? []),
+      ...(parseReplyFormat(agentConfig?.["replyFormat"]) ? ["create-pdf"] : []),
+    ]);
 
     const meta: Record<string, string> = { userId };
     if (userName) meta["userName"] = userName;
@@ -1840,6 +1813,8 @@ export async function processTask(
     // automation runs to the shared read-only sbx-git sandbox instead of cloning
     // a per-project golden snapshot (see sandboxRepoSetup → resolveSbxGit).
     if (eventType) meta["eventType"] = eventType;
+    // Set by claw-auth start-run: scopes the sandbox profiles this run can use.
+    if (typeof agentConfig?.["workspaceId"] === "string") meta["workspaceId"] = agentConfig["workspaceId"];
     // Surface the originating scheduled-job row id so the scheduledJobControl
     // tool can resolve jobId:"current" (worker forwards it in the run body).
     if (scheduledJobId) meta["scheduledJobId"] = scheduledJobId;
@@ -1993,7 +1968,7 @@ export async function processTask(
       undefined,
       runtimeProviderConfig,
       emitUiWidgetForCustom,
-      taskCommand?.autoTools ?? [],
+      [...forcedTaskCommandTools],
     );
     const {
       tools: customToolDefs,
@@ -2323,17 +2298,7 @@ export async function processTask(
       const rawName = extractRuntimeToolName(tool.name);
       return groups.some((group) => group.writeTools.map(String).includes(rawName));
     };
-    const selectedAsDirect = (tool: ToolDefinition, allowedDirect: string[]): boolean => {
-      const norm = (s: string): string => s.toLowerCase().replace(/_/g, "-");
-      const toolSelectionKey = (tool as { selectionKey?: string }).selectionKey;
-      return allowedDirect.some((d) =>
-        tool.name === d ||
-        tool.name.endsWith(d) ||
-        d.endsWith(`__${tool.name}`) ||
-        norm(tool.name) === norm(d) ||
-        (toolSelectionKey ? d === toolSelectionKey : false),
-      );
-    };
+    const selectedAsDirect = (tool: ToolDefinition, allowedDirect: string[]): boolean => matchesDirectPick(tool, allowedDirect);
     const applyAgentToolFilter = (
       tools: ToolDefinition[],
       cfg: ReturnType<typeof parseToolsConfig>,
@@ -2783,17 +2748,8 @@ export async function processTask(
           // matching across different servers — we compare the whole string,
           // not just the bare suffix, so a config entry from server A can't
           // accidentally grant tools from server B that share a bare name.
-          const norm = (s: string): string =>
-            s.toLowerCase().replace(/_/g, "-");
-          const tNorm = norm(t.name);
           const toolSelectionKey = (t as { selectionKey?: string }).selectionKey;
-          const isDirectPick = allowedDirect.some((d: string) =>
-            t.name === d ||
-            t.name.endsWith(d) ||
-            d.endsWith(`__${t.name}`) ||
-            tNorm === norm(d) ||
-            (toolSelectionKey ? d === toolSelectionKey : false),
-          );
+          const isDirectPick = matchesDirectPick(t, allowedDirect);
           // Gateway tools are exposed as direct tools; keep them when their
           // service name (e.g. "mettle") is selected in tools.gateway.
           // Use stable serviceName metadata instead of mutable display label.
@@ -3011,9 +2967,11 @@ export async function processTask(
     // without a human to approve its card, so a scheduled/automation run (no one
     // watching) must never get the tool. Never alongside the other terminal tools
     // (plan / daily brief own turn termination in their modes).
+    const hasSpacesCardSurface = !!channelId || (progressUrl && typeof progressUrl !== "string");
+    const isChatSurfaceRun = !channelId && !eventType;
     const agentAuthoringEnabled =
       agentConfig?.["agentAuthoring"] === true &&
-      (!!channelId || (progressUrl && typeof progressUrl !== "string")) &&
+      (hasSpacesCardSurface || isChatSurfaceRun) &&
       !isScheduledOrAutomationRun(eventType, conversationId) &&
       !isTwinMentionFlow &&
       !isPlanMode &&
@@ -3036,14 +2994,15 @@ export async function processTask(
       !isScheduledOrAutomationRun(eventType, conversationId) &&
       !isTwinMentionFlow &&
       !isDailyBrief;
-    const hasSpacesCardSurface = !!channelId || (progressUrl && typeof progressUrl !== "string");
-    const isChatSurfaceRun = !channelId && !eventType;
     const describeAgentAvailable = interactiveCardRun && (hasSpacesCardSurface || isChatSurfaceRun);
     if (describeAgentAvailable) {
       allTools.push(buildDescribeAgentTool(describeAgentRef));
     }
     if (interactiveCardRun && hasSpacesCardSurface) {
       allTools.push(buildSuggestConnectorsTool(suggestConnectorsRef, userId, { agentSlug }));
+    }
+    if (describeAgentAvailable) {
+      allTools.push(buildSuggestProvidersTool(suggestProvidersRef, userId));
     }
 
 
@@ -3127,6 +3086,8 @@ export async function processTask(
     // casual chat (rhetorical questions, no verifiable deliverable), so the
     // GLOBAL default skips Twin agents; an explicit per-agent `true` still
     // honors them. Always yields to structured output (it owns delivery).
+    const replyFormat = parseReplyFormat(agentConfig?.["replyFormat"]);
+    if (replyFormat) log(`replyFormat enabled — ≤${replyFormat.maxSections} sections of ≤${replyFormat.maxWords} words`);
     const verifyAllDefault =
       (process.env["RESPONSE_VERIFY_ALL"] ?? "off").toLowerCase() === "on";
     const verifyCfg = agentConfig?.["verifyResponses"] as boolean | undefined;
@@ -3166,6 +3127,7 @@ export async function processTask(
           evidenceRef,
           agentSlug,
           ...(verifyResponseCriteria ? { criteria: verifyResponseCriteria } : {}),
+          ...(replyFormat ? { replyFormat } : {}),
         }),
       );
       log(
@@ -3247,16 +3209,19 @@ export async function processTask(
       eventType === "artifact_app" || (conversationId?.startsWith("app_") ?? false);
     if (isArtifactAppRun) {
       const before = allTools.length;
-      // read-app-file goes with create-app: it is keyed by conversation, and an
-      // app-invoked run carries the `app_` conversation of the app itself, so
-      // leaving it in would let an app read its own source back.
+      // The app tools go with create-app: an app-invoked run acts as the viewer,
+      // so leaving them in would let an app read, rewrite or publish apps —
+      // including itself — on whoever opens it.
       allTools = allTools.filter(
         (t) =>
-          t.name !== "create-app" && t.name !== "read-app-file" && t.name !== "schedule-task",
+          t.name !== "create-app" &&
+          t.name !== "read-app-file" &&
+          t.name !== "publish-app" &&
+          t.name !== "schedule-task",
       );
       if (allTools.length !== before) {
         log(
-          "Artifact-app run — create-app + read-app-file + schedule-task removed (self-replication ban)",
+          "Artifact-app run — create-app + read-app-file + publish-app + schedule-task removed (self-replication ban)",
         );
       }
     }
@@ -3283,6 +3248,17 @@ export async function processTask(
         "sandbox-run", "sandbox-run-detached", "sandbox-write-file",
         "sandbox-create", "sandbox-destroy", "write",
       ]);
+      const pinnedProfile = meta["sandboxRepo"]
+        ? (await getRepoConfigsFor(meta[SDLC_META_KEYS.workspaceId] || meta["workspaceId"]))[meta["sandboxRepo"]]
+        : undefined;
+      if (!forceReadOnlySandbox && pinnedProfile && !pinnedProfile.repoUrl) {
+        RO_DISABLED.delete("sandbox-create");
+        RO_DISABLED.delete("sandbox-destroy");
+        RO_DISABLED.delete("sandbox-run");
+        RO_DISABLED.delete("sandbox-run-detached");
+        RO_DISABLED.delete("sandbox-write-file");
+        RO_DISABLED.delete("write");
+      }
       const before = allTools.length;
       allTools = allTools.filter((t) => !RO_DISABLED.has(t.name));
       if (allTools.length !== before) {
@@ -3394,6 +3370,7 @@ export async function processTask(
     );
     const catalogActive = fastModeEnabled || survivingCatalogItems.length > 0 || isOrchestratorRun;
     const suggestConnectorsRegistered = allTools.some((tool) => tool.name === SUGGEST_CONNECTORS_TOOL_NAME);
+    const suggestProvidersRegistered = allTools.some((tool) => tool.name === SUGGEST_PROVIDERS_TOOL_NAME);
     if (catalogActive) {
       fastCatalogItems = survivingCatalogItems;
       fastCatalogNames = fastCatalogItems.map((item) => item.entry.name);
@@ -3559,6 +3536,16 @@ export async function processTask(
       const connectorPrimer = renderUnresolvedConfigured(unresolvedConfigured, suggestConnectorsRegistered);
       fullContext = fullContext ? `${fullContext}\n\n${connectorPrimer}` : connectorPrimer;
       log(`[connectors] configured-but-unresolved: ${unresolvedConfigured.map((u) => `${u.serverType}:${u.reason}`).join(", ")}`);
+    }
+
+    if (suggestProvidersRegistered) {
+      const runModelPrimer = [
+        "## Your model",
+        `You are running on provider \`${provider ?? "spaces"}\`, model \`${effectiveModel}\`.`,
+        "If the user asks what model or provider YOU run on, answer from this line — it is your own configuration.",
+        "That is NOT a question about their connected accounts, so do not call suggest-providers for it and do not say the model is unavailable to you.",
+      ].join("\n");
+      fullContext = fullContext ? `${fullContext}\n\n${runModelPrimer}` : runModelPrimer;
     }
 
     // /goal-awareness primer. Injected only when suggest-goal is registered
@@ -3735,7 +3722,8 @@ export async function processTask(
       const pinnedRepoName =
         (agentConfig?.["sandboxRepo"] as string | undefined) ?? undefined;
       const pinnedRepo = pinnedRepoName
-        ? REPO_CONFIGS[pinnedRepoName]
+        ? // Same scope as the sandbox tools: built-ins plus this run's workspace.
+          (await getRepoConfigsFor(meta[SDLC_META_KEYS.workspaceId] || meta["workspaceId"]))[pinnedRepoName]
         : undefined;
       if (pinnedRepoName && pinnedRepo) {
         const installPkgs = pinnedRepo.steps
@@ -4139,6 +4127,7 @@ export async function processTask(
         userId,
         task,
         context: fullContext,
+        ...(agentHandoff ? { agentHandoff } : {}),
         // Automation/scheduled runs draw from the low-priority LiteLLM key so
         // batch fleets can't queue interactive mentions (same predicate as the
         // read-only sandbox routing above).
@@ -4173,7 +4162,7 @@ export async function processTask(
           : {}),
         ...(twinPersonaBlock ? { twinPersona: twinPersonaBlock } : {}),
         abortSignal,
-        debugStartedAt: parallelFollowUpStartedAt,
+        debugStartedAt: runDebugStartedAt,
         // Raw Spaces identity for progress callbacks → lets /webhook/progress fall
         // back to claw-auth's conv-keyed session index (mirrors the /result body).
         progressMeta: {
@@ -4187,6 +4176,7 @@ export async function processTask(
           ? { verifyResponsesRef: evidenceRef }
           : {}),
         citationReflection,
+        replyFormat,
         autoToolCitations,
         // Thread invocations (Spaces/Slack replies — channelId present) keep a
         // clean posted reply = the last 2 assistant turns; ask-ai and every other
@@ -4308,9 +4298,77 @@ export async function processTask(
       result.text,
       pendingQuestions,
     );
-    const inlineFollowUps = shouldAttachGeneratedFollowUps
-      ? parallelFollowUpResult
-      : undefined;
+    // End-of-loop follow-up generation: the agent's final answer is now known,
+    // so the fast model gets (history, user request, final answer). When a
+    // late-delivery callback exists, generation runs in the background after
+    // the answer is posted, so the answer's latency is unchanged. Without one,
+    // we await it inline (bounded by the generator's own timeout).
+    // NOTE: the "parallel_pending" outcome name is kept for wire compatibility
+    // with claw-auth / the dashboard debug panel; it now means "generating
+    // after the answer, delivered via the late follow-ups callback".
+    const lateFollowUpDeliveryUrl =
+      shouldAttachGeneratedFollowUps && lateFollowUpCallbackUrl
+        ? buildLateFollowUpCallbackUrl(lateFollowUpCallbackUrl)
+        : undefined;
+    const followUpStartedAt = new Date().toISOString();
+    const followUpDebugSeq = Date.now();
+    const startFollowUpGeneration = (
+      signal: AbortSignal | undefined,
+    ): Promise<{ generation: FollowUpGenerationResult; completedAt: string }> => {
+      const lifecycle = {
+        sessionId,
+        model: LITELLM.fastModel,
+        generationInput: followUpGenerationInput,
+        conversationMessageCount: followUpConversationHistory.length,
+        ...(followUpAgentContext ? { agentContext: followUpAgentContext } : {}),
+      };
+      pushDebugProgress(
+        progressUrl,
+        sessionId,
+        buildFollowUpGenerationStartEvent({
+          seq: followUpDebugSeq,
+          at: followUpStartedAt,
+          ...lifecycle,
+        }),
+      );
+      return generateFollowUpSuggestions({
+        task,
+        finalResponse: result.text,
+        agentContext: followUpAgentContext,
+        conversationHistory: followUpConversationHistory,
+        abortSignal: signal,
+      }).then((generation) => {
+        const settled = { generation, completedAt: new Date().toISOString() };
+        pushDebugProgress(
+          progressUrl,
+          sessionId,
+          buildFollowUpGenerationEndEvent({
+            seq: followUpDebugSeq + 1,
+            at: settled.completedAt,
+            startedAt: followUpStartedAt,
+            ...lifecycle,
+            generation,
+          }),
+        );
+        return settled;
+      });
+    };
+    let followUpPromise:
+      | Promise<{ generation: FollowUpGenerationResult; completedAt: string }>
+      | undefined;
+    let inlineFollowUps:
+      | { generation: FollowUpGenerationResult; completedAt: string }
+      | undefined;
+    if (shouldAttachGeneratedFollowUps) {
+      if (lateFollowUpDeliveryUrl) {
+        // The run's abort signal is deliberately NOT passed: the answer has
+        // already been produced, and tearing down the run must not cancel
+        // suggestions for it. The generator enforces its own timeout.
+        followUpPromise = startFollowUpGeneration(undefined);
+      } else {
+        inlineFollowUps = await startFollowUpGeneration(abortSignal);
+      }
+    }
     const followUpOutcome:
       | "delivered_inline"
       | "parallel_pending"
@@ -4375,12 +4433,12 @@ export async function processTask(
         },
         result: `Follow-up generation ${followUpOutcome}.`,
         isError: false,
-        startedAt: parallelFollowUpStartedAt,
+        startedAt: followUpStartedAt,
         durationMs: inlineFollowUps
           ? Math.max(
               0,
               new Date(inlineFollowUps.completedAt).getTime() -
-                new Date(parallelFollowUpStartedAt).getTime(),
+                new Date(followUpStartedAt).getTime(),
             )
           : 0,
         status: followUpOutcome === "parallel_pending" ? ("running" as const) : ("completed" as const),
@@ -4725,6 +4783,15 @@ export async function processTask(
       ...(result.reasoning && result.reasoning.trim()
         ? { reasoning: result.reasoning }
         : {}),
+      // The turn as ordered thinking / text / tool parts, ending in exactly the
+      // answer delivered as `result` (same citation sanitizing).
+      ...(result.parts?.length && structuredOutputPayload === undefined
+        ? {
+            parts: TurnParts.alignFinalAnswer(result.parts, callbackResultText, (text) =>
+              sanitizeCitations(text, result.toolInvocations, result.sessionClfTokens),
+            ),
+          }
+        : {}),
       ...(result.latency ? { latency: result.latency } : {}),
       ...(result.toolInvocations.length > 0
         ? { toolInvocations: result.toolInvocations }
@@ -4750,6 +4817,9 @@ export async function processTask(
       ...(suggestConnectorsRef.value
         ? { pendingConnectorSuggestions: suggestConnectorsRef.value }
         : {}),
+      ...(suggestProvidersRef.value
+        ? { pendingProviderSuggestions: suggestProvidersRef.value }
+        : {}),
       ...(blockedConnectors.size > 0 ? { blockedConnectors: [...blockedConnectors] } : {}),
       ...(proposeAgentRef.value || describeAgentRef.value
         ? { pendingAgentCard: proposeAgentRef.value ?? describeAgentRef.value }
@@ -4764,18 +4834,16 @@ export async function processTask(
       provider: completedProvider,
       model: completedModel,
     });
-    if (
-      followUpOutcome === "parallel_pending" &&
-      parallelFollowUpPromise &&
-      lateFollowUpCallbackUrl
-    ) {
-      const lateCallbackUrl = buildLateFollowUpCallbackUrl(lateFollowUpCallbackUrl);
-      if (lateCallbackUrl) {
-        void parallelFollowUpPromise.then(async ({ generation, completedAt }) => {
+    if (followUpOutcome === "parallel_pending" && followUpPromise && lateFollowUpDeliveryUrl) {
+      // Attached only after the main result callback above has been sent, so
+      // claw-auth always sees the answer before its follow-up suggestions.
+      const lateCallbackUrl = lateFollowUpDeliveryUrl;
+      void followUpPromise
+        .then(async ({ generation, completedAt }) => {
           const delivered = await sendCallback(lateCallbackUrl, sessionToken, {
             sessionId,
             suggestions: generation.suggestions,
-            startedAt: parallelFollowUpStartedAt,
+            startedAt: followUpStartedAt,
             completedAt,
             answerLength: result.text.length,
             enabledByV2Flag: followUpsEnabledByFlag,
@@ -4794,8 +4862,12 @@ export async function processTask(
           if (!delivered) {
             clog.warn(`[follow-ups] late callback was not delivered sessionId=${sessionId}`);
           }
+        })
+        .catch((err: unknown) => {
+          clog.warn(
+            `[follow-ups] late generation failed sessionId=${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+          );
         });
-      }
     }
   } catch (err) {
     if (err instanceof RunHandoffError) {
@@ -4945,6 +5017,9 @@ export async function processTask(
         ...(describeAgentRef.value ? { pendingAgentCard: describeAgentRef.value } : {}),
         ...(suggestConnectorsRef.value
           ? { pendingConnectorSuggestions: suggestConnectorsRef.value }
+          : {}),
+        ...(suggestProvidersRef.value
+          ? { pendingProviderSuggestions: suggestProvidersRef.value }
           : {}),
         ...(blockedConnectors.size > 0 ? { blockedConnectors: [...blockedConnectors] } : {}),
         ...(pendingGoalSuggestion ? { pendingGoalSuggestion } : {}),
@@ -5318,7 +5393,7 @@ export async function sendCallback(
     } catch (err) {
       lastErr = err;
       clog.error(
-        `[run] Callback to ${url} threw (session=${sid}, attempt=${attempt}, bytes=${body.length}): ${err instanceof Error ? err.message : String(err)}`,
+        `[run] Callback to ${url} threw (session=${sid}, attempt=${attempt}, bytes=${body.length}): ${describeFetchError(err)}`,
       );
       if (attempt === maxAttempts) return false;
     }

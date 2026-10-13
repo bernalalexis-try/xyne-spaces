@@ -22,7 +22,7 @@ import {
   isDeskChannelType,
 } from '@xyne/shared';
 import { syncConversationTicketMdFromPrismaTicket } from '@/utils/ticketMd';
-import { emitEventToWorkspaceApps } from '../core/eventSubscriptionUtils';
+import { emitEventToChannelApps } from '../core/eventSubscriptionUtils';
 import { AppEventType, AdditionalFormFieldUpdatedPayload, BaseAppEvent } from '../types';
 import { emailService } from '@/services/emailService';
 import { uploadFiles } from '@/services/fileUploadService';
@@ -87,7 +87,6 @@ const CreateTicketBodySchema = z.object({
   stageName: z.string().trim().optional(),
   eta: z.string().datetime({ message: 'ETA must be a valid ISO 8601 date string' }).optional(),
   ticketType: z.string().trim().optional(),
-  merchantId: z.string().trim().min(1, 'Merchant ID cannot be empty').optional(),
   dynamicFields: z.record(z.unknown()).optional(),
 }).refine(
   data => !!data.channelId || !!data.channelName,
@@ -116,8 +115,6 @@ const UpdateTicketBodySchema = z.object({
   boardId: z.string().min(1, 'Board ID cannot be empty').trim().optional(),
   isArchived: z.boolean().optional(),
   tags: z.array(z.string().trim().min(1, 'Tags cannot be empty')).optional(),
-  // null clears the merchant link
-  merchantId: z.string().trim().min(1, 'Merchant ID cannot be empty').nullable().optional(),
   dynamicFields: z.record(z.unknown()).optional(),
 }).refine(
   data => !!data.channelId || !!data.channelName || !!data.conversationId,
@@ -127,8 +124,7 @@ const UpdateTicketBodySchema = z.object({
     data.assigneeId || data.assignedToEmail || data.stageName || data.groupId ||
     data.title || data.description || data.priority || data.eta ||
     data.ticketType || data.statusV2 || data.boardId || data.assignedUserGroupAlias ||
-    data.isArchived !== undefined || data.tags || data.dynamicFields ||
-    data.merchantId !== undefined
+    data.isArchived !== undefined || data.tags || data.dynamicFields
   ),
   { message: 'At least one field to update is required', path: ['assigneeId'] }
 ).refine(
@@ -582,7 +578,6 @@ export class TicketController {
         stageName: requestedStageName,
         eta: etaString,
         ticketType,
-        merchantId,
         dynamicFields,
       } = bodyResult.data;
 
@@ -696,7 +691,7 @@ export class TicketController {
             // Full role assignment will be done after ticket creation
             pendingFullRoleAssignment = true;
           } else {
-          const assignmentResult = await evaluateAssignmentRule(userGroupId, boardId, undefined, undefined, projectId);
+          const assignmentResult = await evaluateAssignmentRule(userGroupId, boardId, undefined, undefined, projectId, resolvedChannelId);
           if (assignmentResult.assignedUserId) {
             resolvedAssignedTo = assignmentResult.assignedUserId;
             }
@@ -721,7 +716,6 @@ export class TicketController {
         stageName: resolvedStageName,
         eta: etaDate,
         ticketType,
-        merchantId,
         customFieldValues,
       });
 
@@ -752,6 +746,7 @@ export class TicketController {
             boardId,
             createdBy: userId,
             projectId,
+            channelId: resolvedChannelId,
           });
           const primaryUserId = primaryUserIdOf(fullRoles);
           if (primaryUserId) {
@@ -837,7 +832,6 @@ export class TicketController {
         boardId,
         isArchived,
         tags,
-        merchantId,
         dynamicFields,
       } = bodyResult.data;
 
@@ -861,6 +855,7 @@ export class TicketController {
           statusV2: true,
           userGroupId: true,
           assignedTo: true,
+          channelId: true,
         },
       });
       if (!ticket) {
@@ -1023,7 +1018,6 @@ export class TicketController {
       if (ticketType !== undefined) directUpdates.ticketType = ticketType;
       if (statusV2 !== undefined) directUpdates.statusV2 = statusV2;
       if (isArchived !== undefined) directUpdates.isArchived = isArchived;
-      if (merchantId !== undefined) directUpdates.merchantId = merchantId;
 
       if (Object.keys(directUpdates).length > 0) {
         await repositories.tickets.updateTicketFields(ticketId, directUpdates, userId);
@@ -1069,6 +1063,7 @@ export class TicketController {
               boardId: targetBoardId,
               createdBy: userId,
               projectId: ticket.projectId,
+              channelId: ticket.channelId,
             });
             const primaryUserId = primaryUserIdOf(fullRoles);
             if (primaryUserId) {
@@ -1085,6 +1080,7 @@ export class TicketController {
               undefined,
               undefined,
               ticket.projectId,
+              ticket.channelId ?? null,
             );
             if (assignmentResult.assignedUserId) {
               await ticketService.updateTicketAssignee(ticketId, userId, assignmentResult.assignedUserId);
@@ -1671,8 +1667,15 @@ export class TicketController {
         return;
       }
 
+      // Same assignee/creator enrichment as POST /list/search so app callers
+      // don't need a follow-up users lookup.
+      const { assignedTo, createdBy } = ticketInfo.ticket;
+      const userMap = await getTicketUserInfoMap([assignedTo, createdBy]);
+
       res.status(200).json({
         ...ticketInfo.ticket,
+        assignedToUser: userInfoOrNull(userMap, assignedTo),
+        createdByUser: userInfoOrNull(userMap, createdBy),
         customFormData: ticketInfo.customFormData,
         history: ticketInfo.history,
       });
@@ -2016,7 +2019,7 @@ export class TicketController {
 
       logger.info(`[TicketController] Form field "${fieldName}" updated to "${stringValue}" on ticket ${ticketId}`);
 
-      // Emit ADDITIONAL_FORM_FIELD_UPDATED event to all apps in the workspace
+      // Emit ADDITIONAL_FORM_FIELD_UPDATED event to the apps in the ticket's channel
       // Apps (like Genius) filter by fieldName and boardName to handle specific cases
       try {
         const board = await prismaClient.board.findUnique({
@@ -2052,7 +2055,7 @@ export class TicketController {
           };
 
           // Fire and forget - don't block the response.
-          void emitEventToWorkspaceApps(workspaceId, event);
+          void emitEventToChannelApps(payload.channelId, event);
           
           logger.info(`[TicketController] Emitted ADDITIONAL_FORM_FIELD_UPDATED for field "${fieldName}" on ticket ${ticketId}`);
         }
@@ -2508,7 +2511,7 @@ export class TicketController {
           if (boardMetadata?.fullRoleAssignment === true) {
             pendingFullRoleAssignment = true;
           } else {
-            const assignmentResult = await evaluateAssignmentRule(userGroupId, ticket.boardId, undefined, undefined, ticket.projectId);
+            const assignmentResult = await evaluateAssignmentRule(userGroupId, ticket.boardId, undefined, undefined, ticket.projectId, ticket.channelId ?? null);
             if (assignmentResult.assignedUserId) {
               resolvedAssignedTo = assignmentResult.assignedUserId;
               const updatedTicket = await prismaClient.ticket.update({
@@ -2531,6 +2534,7 @@ export class TicketController {
             boardId: ticket.boardId,
             createdBy: userId,
             projectId: ticket.projectId,
+            channelId: ticket.channelId ?? null,
           });
           const primaryUserId = primaryUserIdOf(fullRoles);
           if (primaryUserId) {

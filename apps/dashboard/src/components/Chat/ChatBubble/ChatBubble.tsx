@@ -6,6 +6,7 @@ import { MessageBubble } from '../../ui/MessageBubble/MessageBubble';
 import { BotBubble } from '../BotBubble';
 import { LinkPreview } from '../LinkPreview/LinkPreview';
 import { InternalMessagePreview } from '../LinkPreview/InternalMessagePreview';
+import { CallLinkPreview } from '../LinkPreview/CallLinkPreview';
 import { CanvasPreview } from '../../Canvas/CanvasPreview';
 import { TicketActivityMessage } from '../TicketActivityMessage/TicketActivityMessage';
 import { ConversationTabContext } from '../ConversationTabContext';
@@ -62,6 +63,8 @@ import {
 } from '../ChatList/ChatListUtils';
 import { useUserBookmarks } from '../../../hooks/useUserBookmarks';
 import { useChannel } from '../../../hooks/useChannels';
+import { useIntentCallSuggestion } from '../../../stores/intentCallSuggestionStore';
+import { IntentCallSuggestionCard } from '../IntentCallSuggestion';
 import { useIsDmReadOnly } from '../../../hooks/useIsDmReadOnly';
 import { usePlatform } from '../../../hooks/usePlatform';
 import { logger, Event } from '../../../utils/logger';
@@ -141,6 +144,7 @@ interface ChatBubbleProps {
   /** Tag being inspected from the thread header; messages carrying it show a chip. */
   inspectedTag?: string | null;
   afterTextContent?: React.ReactNode;
+  showIntentSuggestion?: boolean;
 }
 
 export const ChatBubble: React.FC<ChatBubbleProps> = ({
@@ -170,6 +174,7 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
   highlightMessageId,
   inspectedTag = null,
   afterTextContent,
+  showIntentSuggestion = false,
 }) => {
   const { user } = useAuthContext();
   // Off inside hosts that embed chat for one purpose (the related-context popup).
@@ -1016,11 +1021,25 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
     showThreadTags && context === 'thread' && !isSystemMessage && !isMessageDeleted ? (
       <MessageTags messageActs={message.messageActs} inspectedTag={inspectedTag} />
     ) : null;
+  const intentCallSuggestion = useIntentCallSuggestion(message.messageId);
+  const intentCallCard =
+    showIntentSuggestion &&
+    intentCallSuggestion &&
+    message.senderId === user?.id &&
+    intentCallSuggestion.detection.surface === context &&
+    !isMessageDeleted ? (
+      <IntentCallSuggestionCard
+        suggestion={intentCallSuggestion}
+        channelId={channelId}
+        conversationId={messageConversationId}
+      />
+    ) : null;
   const textTrailer =
-    afterTextContent !== undefined || messageTags ? (
+    afterTextContent !== undefined || messageTags || intentCallCard ? (
       <>
         {afterTextContent}
         {messageTags}
+        {intentCallCard}
       </>
     ) : undefined;
 
@@ -1082,9 +1101,6 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
       ...(!isMessageDeleted && shouldShowCopyButton && { onCopyMessage: handleCopyMessage }),
       ...(!isMessageDeleted && { onEmojiPickerOpenChange: setIsEmojiPickerOpen }),
       isChannelArchived: channel?.isArchived ?? false,
-      // The thread parent sits flush under the thread header, so the default
-      // lift above the row would render the toolbar on top of it.
-      placement: context === 'thread' && isFirstInThread ? 'below' : 'above',
       ...(context === 'channel' &&
         !isSystemMessage &&
         !isMessageDeleted &&
@@ -1370,6 +1386,7 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
             channelScopeType={channelScopeType}
             isFirstInThread={isFirstInThread}
             showLinkPreview={false}
+            callLinkCardShown={shouldShowStandaloneLinkPreview}
             searchItemView={searchItemView}
             {...(onUserClick && { onUserClick })}
             {...(allThreadAttachments && { allThreadAttachments })}
@@ -1516,7 +1533,9 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
       {shouldShowStandaloneLinkPreview && (
         <div
           className={cn(
-            'pr-3 max-w-full pl-4 ml-14 transition-colors rounded-r border-l-4 border-l-gray-300 dark:border-l-gray-600',
+            'pr-3 max-w-full ml-14 transition-colors rounded-r',
+            previewResult.type !== 'call_preview' &&
+              'pl-4 border-l-4 border-l-gray-300 dark:border-l-gray-600',
             message.senderId === user?.id && 'max-[500px]:mb-5',
             'group-data-[hovered]/bubble:bg-accent/50',
           )}
@@ -1527,6 +1546,11 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
                 type: 'internal_message',
                 ...previewResult.data,
               }}
+              onClose={() => setShowLinkPreview(false)}
+            />
+          ) : previewResult.type === 'call_preview' ? (
+            <CallLinkPreview
+              metadata={previewResult.data}
               onClose={() => setShowLinkPreview(false)}
             />
           ) : (

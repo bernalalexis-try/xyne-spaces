@@ -5,6 +5,7 @@ import { CONFIG } from "../config.js";
 import { createLogger } from "../logger.js";
 import { setSession } from "./session-context.js";
 import { resolveProvidersForDispatch } from "./provider-resolution.js";
+import type { ChannelDeliveryTarget } from "../surfaces/messaging/plugin.js";
 
 const log = createLogger("eval-run");
 
@@ -16,7 +17,7 @@ const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 
 export const PLATFORM_DEFAULT_PROVIDER = process.env["EVAL_DEFAULT_PROVIDER"] ?? "litellm";
 
-export const EVAL_JUDGES = ["llm", "jev", "ournormaljev", "ourtrainedjev"] as const;
+export const EVAL_JUDGES = ["llm", "xor", "ourtrainedjev"] as const;
 export type EvalJudge = (typeof EVAL_JUDGES)[number];
 
 export interface EvalTarget {
@@ -40,10 +41,11 @@ export function normalizeJudges(requested: string[] | undefined): EvalJudge[] {
   if (requested.includes("all")) return [...EVAL_JUDGES];
   const alias: Record<string, EvalJudge> = {
     llm: "llm",
-    jev: "jev",
-    ournormaljev: "ournormaljev",
+    jev: "xor",
+    ournormaljev: "xor",
+    xor: "xor",
     ourtrainedjev: "ourtrainedjev",
-    normal: "ournormaljev",
+    normal: "xor",
     trained: "ourtrainedjev",
   };
   const out: EvalJudge[] = [];
@@ -112,6 +114,9 @@ export interface EvalState {
   spacesAppUserId: string;
   appToken: string;
   dispatches: EvalDispatch[];
+  /** Set when /eval was typed in a messaging chat: the arms answer there and
+   *  the comparison goes there too (as a link — it is HTML). */
+  channelDelivery?: ChannelDeliveryTarget;
 }
 
 const EVAL_STATE_PREFIX = "eval:pending:";
@@ -258,6 +263,8 @@ export async function dispatchEvalRun(args: {
   spacesAppUserId: string;
   senderName?: string;
   traceId: string;
+  /** The chat to answer in, when /eval came from one instead of a thread. */
+  channelDelivery?: ChannelDeliveryTarget;
 }): Promise<EvalDispatch> {
   const sessionKey = evalSessionKey(args.conversationId, args.traceId);
   const res = await fetch(`${CONFIG.internalUrl}/claw/api/v1/internal/run`, {
@@ -319,6 +326,8 @@ export async function dispatchEvalRun(args: {
       appToken: args.spacesAppToken,
       spacesAppId: args.spacesAppId,
       spacesAppUserId: args.spacesAppUserId,
+      // Each arm answers in the chat rather than through Spaces.
+      ...(args.channelDelivery ? { channelDelivery: args.channelDelivery, triggerSource: args.channelDelivery.channel } : {}),
     },
     { skipConversationIndex: true },
   );
